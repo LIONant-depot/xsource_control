@@ -382,7 +382,11 @@ public:
             FileStatus fs;
             fs.path = WorkspacePath{ LibraryRelative };
             fs.staged = (x != ' ' && x != '?');
-            fs.modified = (y == 'M');
+            // Any unstaged change in the work tree is "modified": edited (M), deleted (D - these used to fall
+            // through with every flag false, so a deleted file never showed up as pending and could not be
+            // submitted), type-changed (T) or intent-to-add (A). '?' is untracked and '!' ignored.
+            fs.modified = (y != ' ' && y != '?' && y != '!');
+            fs.deleted  = (x == 'D' || y == 'D');
             fs.untracked = (x == '?' && y == '?');
             fs.conflicted = (x == 'U' || y == 'U');
             result.files.push_back(fs);
@@ -483,7 +487,7 @@ public:
                 continue;
             }
 
-            const auto lockRes = RunGitLfs({"lock", ToGitPath(path)});
+            const auto lockRes = RunGitLfs({"lock", CanonPath(path)});
 
             if (!lockRes.launchFailed && lockRes.exitCode == 0)
             {
@@ -606,7 +610,7 @@ public:
             }
 
             const std::string key = ToGitPath(path);
-            std::vector<std::string> args = {"unlock", key};
+            std::vector<std::string> args = {"unlock", CanonPath(path)};
             if (request.force) args.push_back("--force");
 
             const auto res = RunGitLfs(args);
@@ -733,6 +737,15 @@ public:
         {
             result.error = MakeError(ErrorCode::Offline, "Could not reach remote.", res);
         }
+        else if (request.fastForwardOnly && NeedsIntegration(combined))
+        {
+            // A fast-forward is impossible: either this branch has local commits the remote does not (a
+            // Submit whose push was rejected leaves exactly that, and `--ff-only` can then NEVER succeed - the
+            // tool used to dead-end here), or an incoming change touches a file with local edits. Replay
+            // the local commits on top of the remote instead; a real content conflict is still left to
+            // the user - the rebase is aborted and the tree is left exactly as it was found.
+            return IntegrateRemote();
+        }
         else if (detail::Contains(combined, "would be overwritten") || detail::Contains(combined, "non-fast-forward"))
         {
             result.error = MakeError(ErrorCode::Conflict,
@@ -764,8 +777,12 @@ public:
             }
         }
 
+        std::vector<std::string> canonPaths;
+        canonPaths.reserve(request.paths.size());
+        for (const auto& p : request.paths) canonPaths.push_back(CanonPath(p));
+
         std::vector<std::string> addArgs = {"add", "--"};
-        for (const auto& p : request.paths) addArgs.push_back(ToGitPath(p));
+        for (const auto& c : canonPaths) addArgs.push_back(c);
         const auto addRes = RunGit(addArgs);
         if (addRes.launchFailed || addRes.exitCode != 0)
         {
@@ -781,7 +798,7 @@ public:
         // never silently swept into this one. This is documented git
         // behavior for `git commit <pathspec>`.
         std::vector<std::string> commitArgs = {"commit", "-m", request.description, "--"};
-        for (const auto& p : request.paths) commitArgs.push_back(ToGitPath(p));
+        for (const auto& c : canonPaths) commitArgs.push_back(c);
         const auto commitRes = RunGit(commitArgs);
 
         if (commitRes.launchFailed || commitRes.exitCode != 0)
@@ -817,7 +834,37 @@ public:
             return result;
         }
 
-        const auto Failure = ClassifyPushFailure(pushRes);
+        auto Failure = ClassifyPushFailure(pushRes);
+
+        // The remote moved on since the last pull. Integrate it (see IntegrateRemote) and push once more, so a
+        // submit needs no manual pull/merge unless the remote change truly conflicts with ours.
+        if (Failure.errorCode == ErrorCode::Conflict)
+        {
+            const auto Integrated = IntegrateRemote();
+            if (Integrated.succeeded)
+            {
+                if (const auto hash2 = RunGit({"rev-parse", "HEAD"}); !hash2.launchFailed && hash2.exitCode == 0)
+                    result.localRevision = detail::Trim(hash2.stdOut);
+
+                const auto retry = RunGit({"push"});
+                if (!retry.launchFailed && retry.exitCode == 0)
+                {
+                    result.completedPhases |=
+                        SubmitPhaseFlags::Uploaded | SubmitPhaseFlags::RemoteRevisionMade | SubmitPhaseFlags::Published;
+                    result.remoteRevision = result.localRevision;
+                    result.retryMayDuplicateRemoteEffect = false;
+                    result.warnings.push_back("The remote had newer commits - they were merged in (local commit rebased on top) before pushing.");
+                    ReleaseSessionLocksFor(request.paths, request.keepLocks, result);
+                    return result;
+                }
+                Failure = ClassifyPushFailure(retry);
+            }
+            else if (Integrated.error)
+            {
+                result.warnings.push_back(Integrated.error->message);
+            }
+        }
+
         result.recovery = Failure.recovery;
         result.remoteStateAmbiguous = Failure.remoteStateAmbiguous;
         result.warnings.push_back(Failure.message);
@@ -860,6 +907,77 @@ public:
     }
 
 private:
+    // True when a failed `git pull --ff-only` failed for a reason integrating (rebasing) can fix.
+    [[nodiscard]] static bool NeedsIntegration(const std::string& lowerCombined)
+    {
+        return detail::Contains(lowerCombined, "not possible to fast-forward")
+            || detail::Contains(lowerCombined, "diverging branches")
+            || detail::Contains(lowerCombined, "need to specify how to reconcile")
+            || detail::Contains(lowerCombined, "would be overwritten");
+    }
+
+    // Brings the remote's newer commits in: replays this branch's local, unpushed commits on top of them
+    // (`git pull --rebase --autostash`, so uncommitted edits elsewhere in the tree do not block it and are
+    // put back afterwards). If the two sides genuinely conflict, the rebase is aborted - git restores the
+    // stashed edits itself - so the working tree is left exactly as it was found and the conflicting files
+    // are named for the user, who resolves them with their normal git tooling.
+    [[nodiscard]] SyncResult IntegrateRemote()
+    {
+        SyncResult result;
+        const auto res = RunGit({"pull", "--rebase", "--autostash"});
+        if (res.launchFailed)
+        {
+            result.error = MakeError(ErrorCode::ProviderInternalError, "git pull --rebase failed to launch.", res);
+            return result;
+        }
+
+        const std::string output = res.stdOut + res.stdErr;
+        const std::string lower  = detail::ToLower(output);
+        if (res.exitCode == 0 && !detail::Contains(lower, "applying autostash resulted in conflicts"))
+        {
+            result.succeeded = true;
+            result.summary = "Brought in the remote's newer commits. " + detail::Trim(res.stdOut);
+            return result;
+        }
+
+        if (detail::Contains(lower, "applying autostash resulted in conflicts"))
+        {
+            result.error = MakeError(ErrorCode::Conflict,
+                "The remote's changes were merged in, but they overlap edits you have not committed yet: "
+                "those files now contain conflict markers (your edits are also kept in the git stash). "
+                "Resolve them with your normal git tooling.", res);
+            return result;
+        }
+
+        // A conflicting rebase stops half way - put everything back the way it was.
+        if (detail::Contains(lower, "conflict") || detail::Contains(lower, "could not apply"))
+        {
+            (void)RunGit({"rebase", "--abort"});
+
+            std::string files;
+            std::size_t pos = 0;
+            while (pos < output.size())
+            {
+                const auto eol = output.find(char(10), pos);
+                const std::string line = output.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+                if (const auto at = line.find("Merge conflict in "); at != std::string::npos)
+                    files += (files.empty() ? "" : ", ") + detail::Trim(line.substr(at + 18));
+                if (eol == std::string::npos) break;
+                pos = eol + 1;
+            }
+            result.error = MakeError(ErrorCode::Conflict,
+                "Your commit conflicts with newer changes on the remote" + (files.empty() ? std::string{} : " in: " + files) +
+                ". Nothing was changed - resolve it with your normal git tooling (merge or rebase), then push.", res);
+            return result;
+        }
+
+        if (detail::Contains(lower, "could not resolve host") || detail::Contains(lower, "connection timed out"))
+            result.error = MakeError(ErrorCode::Offline, "Could not reach remote.", res);
+        else
+            result.error = MakeError(ErrorCode::ProviderProtocolError, "git pull --rebase failed.", res);
+        return result;
+    }
+
     // Builds one canonical sc::LockInfo from a single git-lfs --json lock
     // object ({"id":...,"path":...,"owner":{"name":...},"locked_at":...}).
     // `locked_at` is a real ISO-8601 timestamp git-lfs already gives us, but
@@ -944,7 +1062,7 @@ private:
             }
 
             anyLockAttempted = true;
-            const auto unlockResult = RunGitLfs({"unlock", key});
+            const auto unlockResult = RunGitLfs({"unlock", CanonPath(path)});
 
             if (unlockResult.Succeeded())
             {
@@ -980,6 +1098,51 @@ private:
         std::vector<std::string> full = {"git", "lfs"};
         full.insert(full.end(), args.begin(), args.end());
         return ProcessRunner::Run(full, repoRoot_);
+    }
+
+    // ToGitPath, with every component's letter case corrected to what is really on disk (or, for a file that
+    // was deleted, in the index). The editor's status cache keys paths lower-cased, so callers hand us
+    // "assets/normalmap.png" for "Assets/NormalMap.png". `git add` accepts that on a case-insensitive file
+    // system (it looks at the disk), but `git commit -- <pathspec>` and `git checkout --` / `git lfs lock`
+    // match case-sensitively against the index and fail with "pathspec ... did not match any file(s) known
+    // to git" - which is what made every submit from the Source Control tab fail.
+    [[nodiscard]] std::string CanonPath(const WorkspacePath& path) const
+    {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        fs::path current = repoRoot_;
+        fs::path resolved;
+        bool found = true;
+        for (const auto& component : path.relative)
+        {
+            if (component == ".") continue;
+            const std::string want = detail::ToLower(component.string());
+            bool hit = false;
+            for (fs::directory_iterator it(current, ec), end; !ec && it != end; it.increment(ec))
+            {
+                const std::string name = it->path().filename().string();
+                if (detail::ToLower(name) == want) { resolved /= name; current /= name; hit = true; break; }
+            }
+            if (!hit) { found = false; break; }
+        }
+        if (found && !resolved.empty()) return resolved.generic_string();
+
+        // Missing on disk (a deletion): the index still knows the real spelling.
+        const auto res = RunGit({"ls-files", "-z", "--", ":(icase)" + ToGitPath(path)});
+        if (!res.launchFailed && res.exitCode == 0)
+        {
+            const auto tokens = detail::SplitByNul(res.stdOut);
+            if (!tokens.empty() && !tokens.front().empty()) return tokens.front();
+        }
+
+        // A deletion that is already staged is no longer in the index either - the last commit still has it.
+        const std::string wantLower = detail::ToLower(ToGitPath(path));
+        const auto head = RunGit({"ls-tree", "-r", "-z", "--name-only", "HEAD"});
+        if (!head.launchFailed && head.exitCode == 0)
+            for (const auto& name : detail::SplitByNul(head.stdOut))
+                if (detail::ToLower(name) == wantLower) return name;
+
+        return ToGitPath(path);
     }
 
     [[nodiscard]] static std::string ToGitPath(const WorkspacePath& path)
@@ -1246,7 +1409,7 @@ private:
         }
 
         std::vector<std::string> args = std::move(baseArgs);
-        for (const auto& item : items) args.push_back(ToGitPath(item));
+        for (const auto& item : items) args.push_back(CanonPath(item));
 
         const auto res = RunGit(args);
 

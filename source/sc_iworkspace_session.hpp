@@ -250,6 +250,7 @@ namespace sc
         bool modified    = false;
         bool untracked   = false;
         bool conflicted  = false;
+        bool deleted     = false; // removed from the working tree (staged or not); `modified` is also set, so it counts as a pending change
         bool lfsTracked  = false; // == "binary/non-mergeable/lock-required" -- see spec Part IV
     };
 
